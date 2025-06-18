@@ -1,3 +1,6 @@
+//!
+//! gRPC service.
+//!
 use {
     crate::{
         config::{ConfigGrpc, ConfigTokio},
@@ -58,6 +61,7 @@ use {
     },
 };
 
+/// Represents the status of a blockhash, tracking its confirmation levels.
 #[derive(Debug)]
 struct BlockhashStatus {
     slot: u64,
@@ -77,22 +81,34 @@ impl BlockhashStatus {
     }
 }
 
+/// The inner state of the `BlockMetaStorage`.
 #[derive(Debug, Default)]
 struct BlockMetaStorageInner {
+    /// A map from slot number to block metadata.
     blocks: HashMap<u64, Arc<MessageBlockMeta>>,
+    /// A map from blockhash to its status.
     blockhashes: HashMap<String, BlockhashStatus>,
+    /// The latest slot that has been processed.
     processed: Option<u64>,
+    /// The latest slot that has been confirmed.
     confirmed: Option<u64>,
+    /// The latest slot that has been finalized.
     finalized: Option<u64>,
 }
 
+/// A storage for block metadata and blockhashes.
+/// This is used to serve unary requests like `GetLatestBlockhash` and `IsBlockhashValid`.
 #[derive(Debug)]
 struct BlockMetaStorage {
+    /// A semaphore to limit concurrent read access for unary requests.
     read_sem: Semaphore,
+    /// The inner storage, protected by a `RwLock` for concurrent access.
     inner: Arc<RwLock<BlockMetaStorageInner>>,
 }
 
 impl BlockMetaStorage {
+    /// Creates a new `BlockMetaStorage` and a channel to send messages to it.
+    /// It spawns a background task to process incoming messages.
     fn new(unary_concurrency_limit: usize) -> (Self, mpsc::UnboundedSender<Message>) {
         let inner = Arc::new(RwLock::new(BlockMetaStorageInner::default()));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -105,6 +121,7 @@ impl BlockMetaStorage {
                 let mut storage = storage.write().await;
                 match message {
                     Message::Slot(msg) => {
+                        // Update the latest slot for each commitment level.
                         match msg.status {
                             SlotStatus::Processed => {
                                 storage.processed.replace(msg.slot);
@@ -118,6 +135,7 @@ impl BlockMetaStorage {
                             _ => {}
                         }
 
+                        // Update the blockhash status if the block is already known.
                         if let Some(blockhash) = storage
                             .blocks
                             .get(&msg.slot)
@@ -142,6 +160,7 @@ impl BlockMetaStorage {
                             }
                         }
 
+                        // When a slot is finalized, prune old data.
                         if msg.status == SlotStatus::Finalized {
                             if let Some(keep_slot) = msg.slot.checked_sub(KEEP_SLOTS) {
                                 storage.blocks.retain(|slot, _block| *slot >= keep_slot);
@@ -157,6 +176,7 @@ impl BlockMetaStorage {
                         }
                     }
                     Message::BlockMeta(msg) => {
+                        // Store new block metadata.
                         storage.blocks.insert(msg.slot, msg);
                     }
                     msg => {
@@ -175,6 +195,7 @@ impl BlockMetaStorage {
         )
     }
 
+    /// Parses the commitment level from a gRPC request.
     fn parse_commitment(commitment: Option<i32>) -> Result<CommitmentLevel, Status> {
         let commitment = commitment.unwrap_or(CommitmentLevelProto::Processed as i32);
         CommitmentLevelProto::try_from(commitment)
@@ -185,6 +206,7 @@ impl BlockMetaStorage {
             })
     }
 
+    /// A generic helper to get block information based on a commitment level.
     async fn get_block<F, T>(
         &self,
         handler: F,
@@ -212,6 +234,7 @@ impl BlockMetaStorage {
         }
     }
 
+    /// Checks if a blockhash is valid for a given commitment level.
     async fn is_blockhash_valid(
         &self,
         blockhash: &str,
@@ -246,6 +269,7 @@ impl BlockMetaStorage {
     }
 }
 
+/// A simple counter to generate unique message IDs.
 #[derive(Debug, Default)]
 struct MessageId {
     id: u64,
@@ -258,32 +282,53 @@ impl MessageId {
     }
 }
 
+/// Aggregates all messages and data for a single slot.
 #[derive(Debug, Default)]
 struct SlotMessages {
-    messages: Vec<Option<(u64, Message)>>, // Option is used for accounts with low write_version
+    /// A vector holding all messages for the slot.
+    /// `Option` is used to "remove" account updates that are superseded by newer ones
+    /// with a higher write_version, avoiding reordering.
+    messages: Vec<Option<(u64, Message)>>,
+    /// Holds only the `SlotStatus` messages for this slot.
     messages_slots: Vec<(u64, Message)>,
+    /// The block metadata for this slot.
     block_meta: Option<Arc<MessageBlockMeta>>,
+    /// All transactions for this slot.
     transactions: Vec<Arc<MessageTransactionInfo>>,
-    accounts_dedup: HashMap<Pubkey, (u64, usize)>, // (write_version, message_index)
+    /// Used to deduplicate account updates, keeping only the one with the highest write_version.
+    /// Maps a pubkey to `(write_version, message_index)`.
+    accounts_dedup: HashMap<Pubkey, (u64, usize)>,
+    /// All entries (shreds) for this slot.
     entries: Vec<Arc<MessageEntry>>,
+    /// A flag indicating if the block for this slot has been "sealed".
+    /// A block is sealed when all its components (transactions, entries) have been received.
     sealed: bool,
+    /// The total number of entries expected for this block, from the block metadata.
     entries_count: usize,
+    /// The index in `messages` where this slot was confirmed.
     confirmed_at: Option<usize>,
+    /// The index in `messages` where this slot was finalized.
     finalized_at: Option<usize>,
+    /// The parent slot.
     parent_slot: Option<Slot>,
+    /// A flag indicating if this slot has been confirmed.
     confirmed: bool,
+    /// A flag indicating if this slot has been finalized.
     finalized: bool,
 }
 
 impl SlotMessages {
+    /// Tries to seal the block for this slot.
+    /// A block is sealed when all its expected transactions and entries have been received.
+    /// When sealed, a `Message::Block` is created, which aggregates all the slot's data.
     pub fn try_seal(&mut self, msgid_gen: &mut MessageId) -> Option<(u64, Message)> {
         if !self.sealed {
             if let Some(block_meta) = &self.block_meta {
                 let executed_transaction_count = block_meta.executed_transaction_count as usize;
                 let entries_count = block_meta.entries_count as usize;
 
-                // Additional check `entries_count == 0` due to bug of zero entries on block produced by validator
-                // See GitHub issue: https://github.com/solana-labs/solana/issues/33823
+                // Additional check `entries_count == 0` due to a bug where validators might produce blocks
+                // with zero entries. See: https://github.com/solana-labs/solana/issues/33823
                 if self.transactions.len() == executed_transaction_count
                     && (entries_count == 0 || self.entries.len() == entries_count)
                 {
@@ -320,15 +365,22 @@ impl SlotMessages {
     }
 }
 
+/// A message that is broadcast to all subscribed clients.
+/// It contains the commitment level and a batch of messages.
 type BroadcastedMessage = (CommitmentLevel, Arc<Vec<(u64, Message)>>);
 
+/// The response to a replay request.
 enum ReplayedResponse {
+    /// A vector of historical messages.
     Messages(Vec<(u64, Message)>),
+    /// An error indicating that the requested slot is no longer available.
     Lagged(Slot),
 }
 
+/// A request to replay historical data, sent from a `client_loop` to the `geyser_loop`.
 type ReplayStoredSlotsRequest = (CommitmentLevel, Slot, oneshot::Sender<ReplayedResponse>);
 
+/// The main gRPC service struct.
 #[derive(Debug)]
 pub struct GrpcService {
     config_snapshot_client_channel_capacity: usize,
@@ -345,6 +397,9 @@ pub struct GrpcService {
 }
 
 impl GrpcService {
+    /// Creates and initializes the gRPC service.
+    /// This function sets up all necessary components: TCP listener, channels, gRPC server,
+    /// and spawns the core processing loops (`geyser_loop` and the server task).
     #[allow(clippy::type_complexity)]
     pub async fn create(
         config_tokio: ConfigTokio,
@@ -356,7 +411,7 @@ impl GrpcService {
         mpsc::UnboundedSender<Message>,
         Arc<Notify>,
     )> {
-        // Bind service address
+        // Bind to the configured service address.
         let incoming = TcpIncoming::new(
             config.address,
             true,                          // tcp_nodelay
@@ -364,7 +419,8 @@ impl GrpcService {
         )
         .map_err(|error| anyhow::anyhow!(error))?;
 
-        // Snapshot channel
+        // Create the snapshot channel if configured. This is a blocking `crossbeam_channel`
+        // to apply backpressure to the validator during startup.
         let (snapshot_tx, snapshot_rx) = match config.snapshot_plugin_channel_capacity {
             Some(cap) if !is_reload => {
                 let (tx, rx) = crossbeam_channel::bounded(cap);
@@ -373,7 +429,7 @@ impl GrpcService {
             _ => (None, None),
         };
 
-        // Blocks meta storage
+        // Create the storage for unary requests if they are not disabled.
         let (blocks_meta, blocks_meta_tx) = if config.unary_disabled {
             (None, None)
         } else {
@@ -382,9 +438,9 @@ impl GrpcService {
             (Some(blocks_meta), Some(blocks_meta_tx))
         };
 
-        // Messages to clients combined by commitment
+        // Create the broadcast channel for sending processed messages to all clients.
         let (broadcast_tx, _) = broadcast::channel(config.channel_capacity);
-        // attempt to prevent spam of geyser loop with capacity eq 1
+        // Create channels for handling historical data replays if configured.
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
             if config.replay_stored_slots == 0 {
                 (None, None, None)
@@ -393,7 +449,7 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
-        // gRPC server builder with optional TLS
+        // Configure the gRPC server builder, including optional TLS.
         let mut server_builder = Server::builder();
         if let Some(tls_config) = &config.tls_config {
             let (cert, key) = tokio::try_join!(
@@ -428,7 +484,7 @@ impl GrpcService {
             config.filter_names_cleanup_interval,
         )));
 
-        // Create Server
+        // Create the `GeyserServer` instance, wrapping our `GrpcService` implementation.
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
             config_snapshot_client_channel_capacity: config.snapshot_client_channel_capacity,
@@ -451,7 +507,9 @@ impl GrpcService {
             service = service.send_compressed(encoding);
         }
 
-        // Run geyser message loop
+        // Spawn the main geyser message processing loop in its own dedicated OS thread
+        // with a separate Tokio runtime. This isolates the critical processing logic
+        // from the gRPC connection handling tasks.
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         spawn_blocking(move || {
             let mut builder = Builder::new_multi_thread();
@@ -478,15 +536,16 @@ impl GrpcService {
                 ));
         });
 
-        // Run Server
+        // Spawn the main gRPC server task.
         let shutdown = Arc::new(Notify::new());
         let shutdown_grpc = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            // gRPC Health check service
+            // Create and register the gRPC health check service.
             let (mut health_reporter, health_service) = health_reporter();
             health_reporter.set_serving::<GeyserServer<Self>>().await;
 
             server_builder
+                // Add an interceptor for token-based authentication.
                 .layer(interceptor(move |request: Request<()>| {
                     if let Some(x_token) = &config.x_token {
                         match request.metadata().get("x-token") {
@@ -506,6 +565,9 @@ impl GrpcService {
         Ok((snapshot_tx, messages_tx, shutdown))
     }
 
+    /// The core message processing loop.
+    /// This loop receives messages from the Geyser plugin, organizes them by slot,
+    /// reconstructs blocks, and broadcasts them to clients at the appropriate commitment level.
     async fn geyser_loop(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
@@ -537,22 +599,22 @@ impl GrpcService {
                         metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
                     }
 
-                    // Update blocks info
+                    // Send relevant messages to the block metadata storage for unary requests.
                     if let Some(blocks_meta_tx) = &blocks_meta_tx {
                         if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
                             let _ = blocks_meta_tx.send(message.clone());
                         }
                     }
 
-                    // Remove outdated block reconstruction info
+                    // Prune old slot data to prevent memory from growing indefinitely.
                     match &message {
-                        // On startup we can receive multiple Confirmed/Finalized slots without BlockMeta message
-                        // With saved first Processed slot we can ignore errors caused by startup process
+                        // On startup, we might get Confirmed/Finalized slots before seeing Processed.
+                        // We track the first processed slot to avoid logging spurious errors during this phase.
                         Message::Slot(msg) if processed_first_slot.is_none() && msg.status == SlotStatus::Processed => {
                             processed_first_slot = Some(msg.slot);
                         }
                         Message::Slot(msg) if msg.status == SlotStatus::Finalized => {
-                            // keep extra 10 slots + slots for replay
+                            // Keep a buffer of recent slots plus slots needed for replay.
                             if let Some(msg_slot) = msg.slot.checked_sub(10 + replay_stored_slots) {
                                 loop {
                                     match messages.keys().next().cloned() {
@@ -564,6 +626,8 @@ impl GrpcService {
                                                     _ => {}
                                                 }
 
+                                                // If a finalized slot was never sealed, it means we failed to
+                                                // reconstruct the block. Log an error with the reason.
                                                 if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
                                                     let mut reasons = vec![];
                                                     if let Some(block_meta) = slot_messages.block_meta {
@@ -591,6 +655,7 @@ impl GrpcService {
                                         _ => break,
                                     }
                                 }
+                                // Update the first available slot for replay requests.
                                 if let Some(stored) = &replay_first_available_slot {
                                     if let Some(slot) = messages.keys().next().copied() {
                                         stored.store(slot, Ordering::Relaxed);
@@ -601,7 +666,7 @@ impl GrpcService {
                         _ => {}
                     }
 
-                    // Update block reconstruction info
+                    // Get or create the `SlotMessages` for the message's slot.
                     let slot_messages = messages.entry(message.get_slot()).or_default();
                     if let Message::Slot(msg) = &message {
                         match msg.status {
@@ -617,12 +682,13 @@ impl GrpcService {
                             _ => {}
                         }
                     }
+                    // Store slot status messages separately for replay purposes.
                     if matches!(&message, Message::Slot(_)) {
                         slot_messages.messages_slots.push((msgid, message.clone()));
                     } else {
                         slot_messages.messages.push(Some((msgid, message.clone())));
 
-                        // If we already build Block message, new message will be a problem
+                        // If a message arrives for a block that's already sealed, it's an error.
                         if slot_messages.sealed && !(matches!(&message, Message::Entry(_)) && slot_messages.entries_count == 0) {
                             let kind = match &message {
                                 Message::Slot(_) => "Slot",
@@ -648,7 +714,7 @@ impl GrpcService {
                             slot_messages.transactions.push(Arc::clone(&msg.transaction));
                             sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
                         }
-                        // Dedup accounts by max write_version
+                        // Dedup account updates by keeping only the one with the max write_version.
                         Message::Account(msg) => {
                             let write_version = msg.account.write_version;
                             let msg_index = slot_messages.messages.len() - 1;
@@ -669,7 +735,7 @@ impl GrpcService {
                         _ => {}
                     }
 
-                    // Send messages to filter (and to clients)
+                    // A vector to hold messages that will be broadcast in this iteration.
                     let mut messages_vec = Vec::with_capacity(4);
                     if let Some(sealed_block_msg) = sealed_block_msg {
                         messages_vec.push(sealed_block_msg);
@@ -681,7 +747,8 @@ impl GrpcService {
                     };
                     messages_vec.push((msgid, message));
 
-                    // sometimes we do not receive all statuses
+                    // To handle missed slot status messages from the validator, we walk up the parent
+                    // chain and retroactively apply the status if the parent is at a lower commitment level.
                     if let Some((slot, status)) = slot_status {
                         let mut slots = vec![slot];
                         while let Some((parent, Some(entry))) = slots
@@ -717,9 +784,11 @@ impl GrpcService {
                         if let Message::Slot(slot) = &message.1 {
                             let (mut confirmed_messages, mut finalized_messages) = match slot.status {
                                 SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
+                                    // For processed-level statuses, we only broadcast this single message.
                                     (Vec::with_capacity(1), Vec::with_capacity(1))
                                 }
                                 SlotStatus::Confirmed => {
+                                    // For Confirmed, broadcast all messages for this slot.
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
                                             slot_messages.confirmed_at = Some(slot_messages.messages.len());
@@ -733,6 +802,7 @@ impl GrpcService {
                                     (vec, Vec::with_capacity(1))
                                 }
                                 SlotStatus::Finalized => {
+                                    // For Finalized, broadcast all messages for this slot.
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
                                             slot_messages.finalized_at = Some(slot_messages.messages.len());
@@ -747,7 +817,7 @@ impl GrpcService {
                                 }
                             };
 
-                            // processed
+                            // Broadcast processed messages in batches.
                             processed_messages.push(message.clone());
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));
@@ -756,12 +826,12 @@ impl GrpcService {
                                 .as_mut()
                                 .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
 
-                            // confirmed
+                            // Broadcast confirmed messages.
                             confirmed_messages.push(message.clone());
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
 
-                            // finalized
+                            // Broadcast finalized messages.
                             finalized_messages.push(message);
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
@@ -783,6 +853,7 @@ impl GrpcService {
                                 }
                             }
 
+                            // Batch processed messages to reduce broadcast frequency.
                             processed_messages.push(message);
                             if processed_messages.len() >= PROCESSED_MESSAGES_MAX
                                 || !confirmed_messages.is_empty()
@@ -808,6 +879,7 @@ impl GrpcService {
                         }
                     }
                 }
+                // If the batching timer fires, send any pending processed messages.
                 () = &mut processed_sleep => {
                     if !processed_messages.is_empty() {
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));

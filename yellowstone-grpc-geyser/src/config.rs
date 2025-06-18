@@ -1,3 +1,6 @@
+//!
+//! Plugin configuration.
+//!
 use {
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPluginError, Result as PluginResult,
@@ -12,15 +15,22 @@ use {
     yellowstone_grpc_proto::plugin::filter::limits::FilterLimits,
 };
 
+/// The main configuration for the plugin.
+/// It is loaded from a JSON file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Path to the plugin's shared library.
     pub libpath: String,
+    /// Logging configuration.
     #[serde(default)]
     pub log: ConfigLog,
+    /// Tokio runtime configuration.
     #[serde(default)]
     pub tokio: ConfigTokio,
+    /// gRPC service configuration.
     pub grpc: ConfigGrpc,
+    /// Prometheus metrics endpoint configuration.
     #[serde(default)]
     pub prometheus: Option<ConfigPrometheus>,
     /// Collect client filters, processed slot and make it available on prometheus port `/debug_clients`
@@ -29,18 +39,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Loads the configuration from a string.
     fn load_from_str(config: &str) -> PluginResult<Self> {
         serde_json::from_str(config).map_err(|error| GeyserPluginError::ConfigFileReadError {
             msg: error.to_string(),
         })
     }
 
+    /// Loads the configuration from a file.
     pub fn load_from_file<P: AsRef<Path>>(file: P) -> PluginResult<Self> {
         let config = read_to_string(file).map_err(GeyserPluginError::ConfigFileOpenError)?;
         Self::load_from_str(&config)
     }
 }
 
+/// Logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigLog {
@@ -63,17 +76,20 @@ impl ConfigLog {
     }
 }
 
+/// Tokio runtime configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigTokio {
-    /// Number of worker threads in Tokio runtime
+    /// Number of worker threads in Tokio runtime.
     pub worker_threads: Option<usize>,
-    /// Threads affinity
+    /// Threads affinity. A list of CPU cores to which the Tokio worker threads will be bound.
+    /// Can be specified as a comma-separated list of cores and ranges (e.g., "0,1,2-4").
     #[serde(deserialize_with = "ConfigTokio::deserialize_affinity")]
     pub affinity: Option<Vec<usize>>,
 }
 
 impl ConfigTokio {
+    /// Custom deserializer for the `affinity` field.
     fn deserialize_affinity<'de, D>(deserializer: D) -> Result<Option<Vec<usize>>, D::Error>
     where
         D: Deserializer<'de>,
@@ -85,6 +101,9 @@ impl ConfigTokio {
     }
 }
 
+/// Parses a taskset string into a vector of core IDs.
+/// For example, "0,1,5-7" will be parsed into `[0, 1, 5, 6, 7]`.
+/// 将类似 "0,1,2-4" 的字符串解析为用于线程亲和性的 CPU 核心 ID 列表。
 fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
     let mut set = HashSet::new();
     for taskset2 in taskset.split(',') {
@@ -131,12 +150,13 @@ fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
     Ok(vec)
 }
 
+/// gRPC service configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpc {
     /// Address of Grpc service.
     pub address: SocketAddr,
-    /// TLS config
+    /// TLS configuration for the gRPC server.
     pub tls_config: Option<ConfigGrpcServerTls>,
     /// Possible compression options
     #[serde(default)]
@@ -198,14 +218,19 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub replay_stored_slots: u64,
+    /// Enables or disables the HTTP/2 adaptive window size.
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
+    /// The interval for sending HTTP/2 keepalive pings.
     #[serde(default, with = "humantime_serde")]
     pub server_http2_keepalive_interval: Option<Duration>,
+    /// The timeout for receiving an acknowledgement of a keepalive ping.
     #[serde(default, with = "humantime_serde")]
     pub server_http2_keepalive_timeout: Option<Duration>,
+    /// The initial connection-level window size for HTTP/2.
     #[serde(default)]
     pub server_initial_connection_window_size: Option<u32>,
+    /// The initial stream-level window size for HTTP/2.
     #[serde(default)]
     pub server_initial_stream_window_size: Option<u32>,
 }
@@ -248,21 +273,27 @@ impl ConfigGrpc {
     }
 }
 
+/// TLS configuration for the gRPC server.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpcServerTls {
+    /// Path to the server's certificate file.
     pub cert_path: String,
+    /// Path to the server's private key file.
     pub key_path: String,
 }
 
+/// gRPC compression configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpcCompression {
+    /// A list of compression encodings that the server will accept from clients.
     #[serde(
         deserialize_with = "ConfigGrpcCompression::deserialize_compression",
         default = "ConfigGrpcCompression::default_compression"
     )]
     pub accept: Vec<CompressionEncoding>,
+    /// A list of compression encodings that the server will use to send messages.
     #[serde(
         deserialize_with = "ConfigGrpcCompression::deserialize_compression",
         default = "ConfigGrpcCompression::default_compression"
@@ -280,6 +311,7 @@ impl Default for ConfigGrpcCompression {
 }
 
 impl ConfigGrpcCompression {
+    /// Custom deserializer for compression settings.
     fn deserialize_compression<'de, D>(
         deserializer: D,
     ) -> Result<Vec<CompressionEncoding>, D::Error>
@@ -298,6 +330,7 @@ impl ConfigGrpcCompression {
             .collect::<Result<_, _>>()
     }
 
+    /// Default compression settings (Gzip).
     fn default_compression() -> Vec<CompressionEncoding> {
         vec![CompressionEncoding::Gzip, CompressionEncoding::Zstd]
     }
@@ -332,6 +365,7 @@ where
     }
 }
 
+/// Deserializes a value that can be an integer or a string into an `Option` of a numeric type.
 fn deserialize_int_str_maybe<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,

@@ -1,3 +1,6 @@
+//!
+//! Prometheus metrics.
+//!
 use {
     crate::{config::ConfigPrometheus, version::VERSION as VERSION_INFO},
     agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus as GeyserSlosStatus,
@@ -28,47 +31,57 @@ use {
 };
 
 lazy_static::lazy_static! {
+    /// The global Prometheus registry.
     pub static ref REGISTRY: Registry = Registry::new();
 
+    /// Exposes version information as a metric.
     static ref VERSION: IntCounterVec = IntCounterVec::new(
         Opts::new("version", "Plugin version info"),
         &["buildts", "git", "package", "proto", "rustc", "solana", "version"]
     ).unwrap();
 
+    /// Tracks the latest slot number received from Geyser for each status.
     static ref SLOT_STATUS: IntGaugeVec = IntGaugeVec::new(
         Opts::new("slot_status", "Lastest received slot from Geyser"),
         &["status"]
     ).unwrap();
 
+    /// Tracks the latest slot number processed internally by the plugin for each status.
     static ref SLOT_STATUS_PLUGIN: IntGaugeVec = IntGaugeVec::new(
         Opts::new("slot_status_plugin", "Latest processed slot in the plugin to client queues"),
         &["status"]
     ).unwrap();
 
+    /// Counts the total number of failures to construct a full block.
     static ref INVALID_FULL_BLOCKS: IntGaugeVec = IntGaugeVec::new(
         Opts::new("invalid_full_blocks_total", "Total number of fails on constructin full blocks"),
         &["reason"]
     ).unwrap();
 
+    /// The current size of the message queue between the plugin and the gRPC service.
     static ref MESSAGE_QUEUE_SIZE: IntGauge = IntGauge::new(
         "message_queue_size", "Size of geyser message queue"
     ).unwrap();
 
+    /// The total number of active connections to the gRPC service.
     static ref CONNECTIONS_TOTAL: IntGauge = IntGauge::new(
         "connections_total", "Total number of connections to gRPC service"
     ).unwrap();
 
+    /// The total number of active subscriptions, broken down by endpoint and subscription type.
     static ref SUBSCRIPTIONS_TOTAL: IntGaugeVec = IntGaugeVec::new(
         Opts::new("subscriptions_total", "Total number of subscriptions to gRPC service"),
         &["endpoint", "subscription"]
     ).unwrap();
 
+    /// Counts the number of times a slot status was missed and had to be inferred.
     static ref MISSED_STATUS_MESSAGE: IntCounterVec = IntCounterVec::new(
         Opts::new("missed_status_message_total", "Number of missed messages by commitment"),
         &["status"]
     ).unwrap();
 }
 
+/// A message sent to the `DebugClientStatuses` actor to update client state.
 #[derive(Debug)]
 pub enum DebugClientMessage {
     UpdateFilter { id: usize, filter: Box<Filter> },
@@ -77,6 +90,7 @@ pub enum DebugClientMessage {
 }
 
 impl DebugClientMessage {
+    /// A helper to send a debug message only if the sender exists.
     pub fn maybe_send(tx: &Option<mpsc::UnboundedSender<Self>>, get_msg: impl FnOnce() -> Self) {
         if let Some(tx) = tx {
             let _ = tx.send(get_msg());
@@ -84,12 +98,14 @@ impl DebugClientMessage {
     }
 }
 
+/// Holds the live status (filter and last processed slot) for a single client.
 #[derive(Debug)]
 struct DebugClientStatus {
     filter: Box<Filter>,
     processed_slot: Slot,
 }
 
+/// An actor-like service to track the status of all connected clients for debugging purposes.
 #[derive(Debug)]
 struct DebugClientStatuses {
     requests_tx: mpsc::UnboundedSender<oneshot::Sender<String>>,
@@ -103,12 +119,15 @@ impl Drop for DebugClientStatuses {
 }
 
 impl DebugClientStatuses {
+    /// Creates a new `DebugClientStatuses` service and spawns its background task.
     fn new(clients_rx: mpsc::UnboundedReceiver<DebugClientMessage>) -> Arc<Self> {
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         let jh = tokio::spawn(Self::run(clients_rx, requests_rx));
         Arc::new(Self { requests_tx, jh })
     }
 
+    /// The main loop for the `DebugClientStatuses` actor.
+    /// It listens for updates and requests to dump the current state.
     async fn run(
         mut clients_rx: mpsc::UnboundedReceiver<DebugClientMessage>,
         mut requests_rx: mpsc::UnboundedReceiver<oneshot::Sender<String>>,
@@ -161,6 +180,7 @@ impl DebugClientStatuses {
         }
     }
 
+    /// Sends a request to the actor to get the current statuses as a formatted string.
     async fn get_statuses(&self) -> anyhow::Result<String> {
         let (tx, rx) = oneshot::channel();
         self.requests_tx
@@ -171,6 +191,7 @@ impl DebugClientStatuses {
     }
 }
 
+/// The service that runs the Prometheus HTTP server.
 #[derive(Debug)]
 pub struct PrometheusService {
     debug_clients_statuses: Option<Arc<DebugClientStatuses>>,
@@ -178,6 +199,8 @@ pub struct PrometheusService {
 }
 
 impl PrometheusService {
+    /// Creates a new `PrometheusService`.
+    /// This function registers all metrics and starts the HTTP server if configured.
     pub async fn new(
         config: Option<ConfigPrometheus>,
         debug_clients_rx: Option<mpsc::UnboundedReceiver<DebugClientMessage>>,
@@ -290,12 +313,14 @@ impl PrometheusService {
         })
     }
 
+    /// Shuts down the Prometheus server.
     pub fn shutdown(self) {
         drop(self.debug_clients_statuses);
         self.shutdown.notify_one();
     }
 }
 
+/// Handles requests to the `/metrics` endpoint.
 fn metrics_handler() -> http::Result<Response<BoxBody<Bytes, Infallible>>> {
     let metrics = TextEncoder::new()
         .encode_to_string(&REGISTRY.gather())
@@ -308,24 +333,28 @@ fn metrics_handler() -> http::Result<Response<BoxBody<Bytes, Infallible>>> {
         .body(BodyFull::new(Bytes::from(metrics)).boxed())
 }
 
+/// Handles requests to unknown endpoints.
 fn not_found_handler() -> http::Result<Response<BoxBody<Bytes, Infallible>>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(BodyEmpty::new().boxed())
 }
 
+/// Updates the `slot_status` metric.
 pub fn update_slot_status(status: &GeyserSlosStatus, slot: u64) {
     SLOT_STATUS
         .with_label_values(&[status.as_str()])
         .set(slot as i64);
 }
 
+/// Updates the `slot_status_plugin` metric.
 pub fn update_slot_plugin_status(status: SlotStatus, slot: u64) {
     SLOT_STATUS_PLUGIN
         .with_label_values(&[status.as_str()])
         .set(slot as i64);
 }
 
+/// Increments the `invalid_full_blocks_total` metric.
 pub fn update_invalid_blocks(reason: impl AsRef<str>) {
     INVALID_FULL_BLOCKS
         .with_label_values(&[reason.as_ref()])
@@ -333,22 +362,27 @@ pub fn update_invalid_blocks(reason: impl AsRef<str>) {
     INVALID_FULL_BLOCKS.with_label_values(&["all"]).inc();
 }
 
+/// Increments the `message_queue_size` metric.
 pub fn message_queue_size_inc() {
     MESSAGE_QUEUE_SIZE.inc()
 }
 
+/// Decrements the `message_queue_size` metric.
 pub fn message_queue_size_dec() {
     MESSAGE_QUEUE_SIZE.dec()
 }
 
+/// Increments the `connections_total` metric.
 pub fn connections_total_inc() {
     CONNECTIONS_TOTAL.inc()
 }
 
+/// Decrements the `connections_total` metric.
 pub fn connections_total_dec() {
     CONNECTIONS_TOTAL.dec()
 }
 
+/// Updates the `subscriptions_total` metric when a filter changes.
 pub fn update_subscriptions(endpoint: &str, old: Option<&Filter>, new: Option<&Filter>) {
     for (multiplier, filter) in [(-1, old), (1, new)] {
         if let Some(filter) = filter {
@@ -365,6 +399,7 @@ pub fn update_subscriptions(endpoint: &str, old: Option<&Filter>, new: Option<&F
     }
 }
 
+/// Increments the `missed_status_message_total` metric.
 pub fn missed_status_message_inc(status: SlotStatus) {
     MISSED_STATUS_MESSAGE
         .with_label_values(&[status.as_str()])
